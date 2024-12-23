@@ -1,3 +1,8 @@
+# Build Tools
+setuptools>=65.0.0
+wheel>=0.40.0
+build>=1.0.0
+
 # Terminal UI
 rich>=13.7.0
 
