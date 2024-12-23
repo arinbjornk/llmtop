@@ -1,0 +1,14 @@
+# Terminal UI
+rich>=13.7.0
+
+# System Monitoring
+psutil>=5.9.0
+GPUtil>=1.4.0
+
+# LLM Integration
+openai>=1.12.0
+ollama>=0.1.6
+
+# Core Dependencies
+python-dateutil>=2.8.2
+typing-extensions>=4.9.0
