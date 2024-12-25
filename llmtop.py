@@ -4,7 +4,6 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.layout import Layout
 from rich.text import Text
-from rich.text import Text
 from rich.console import Group
 from rich import box
 import psutil
@@ -14,12 +13,11 @@ import os
 import time
 from datetime import datetime
 import argparse
-import openai
-import ollama
 from collections import deque
 from typing import Dict, List, Any
 import logging
 import json
+
 
 # Set up logging configuration at the top of the file
 logging.basicConfig(
@@ -244,9 +242,18 @@ class AlertManager:
 class SystemAnalyzer:
     def __init__(self, use_openai: bool = False):
         self.use_openai = use_openai
-        self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if use_openai else None
+        self.client = None
+        if use_openai:
+            try:
+                import openai
+                self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            except ImportError:
+                logging.warning("OpenAI package not installed. Please install with 'pip install openai'")
+                self.use_openai = False
+        
         self.analyses = deque(maxlen=100)  # Keep last 100 analyses
         self.visible_offset = 0  # Track where we are in the history
+
 
     def get_visible_messages(self, console_height: int) -> List[Dict]:
         """
@@ -320,7 +327,7 @@ class SystemAnalyzer:
             prev_analyses_str = "\n".join([f"Previous analysis {i+1}: {analysis}" 
                                          for i, analysis in enumerate(prev_analyses)])
             
-            if self.use_openai:
+            if self.use_openai and self.client:
                 system_prompt = """You are a system monitoring assistant. Your role is to:
 1. Analyze current system metrics and identify the most significant insight or issue
 2. Avoid repeating the same insights from the previous two analyses
@@ -347,8 +354,9 @@ Generate ONE short statement (max 15 words) about the most significant NEW insig
                 )
                 analysis = response.choices[0].message.content
             else:
-                # Use Ollama with enhanced prompt
+                # Try to use Ollama, fall back to local analysis if not available
                 try:
+                    import ollama
                     ollama_prompt = f"""Previous analyses:
 {prev_analyses_str}
 
@@ -365,9 +373,33 @@ Generate ONE short statement (max 15 words) about the most significant NEW insig
                         }]
                     )
                     analysis = response['message']['content'].strip()
+                except ImportError:
+                    logging.warning("Ollama package not installed. Using local analysis.")
+                    analysis = self._generate_local_analysis(metrics)
                 except Exception as e:
                     logging.error(f"Ollama error: {str(e)}")
                     analysis = self._generate_local_analysis(metrics)
+
+            # Clean up the analysis text
+            analysis = analysis.replace('\n', ' ').strip()
+            
+            # Store analysis with timestamp
+            self.analyses.append({
+                'timestamp': datetime.now(),
+                'analysis': analysis,
+                'estimated_lines': len(analysis) // 50 + 1
+            })
+            
+            return analysis
+            
+        except Exception as e:
+            error_msg = f"Analysis Error: {str(e)}"
+            logging.error(error_msg)
+            self.analyses.append({
+                'timestamp': datetime.now(),
+                'analysis': error_msg
+            })
+            return error_msg
 
             # Clean up the analysis text
             analysis = analysis.replace('\n', ' ').strip()
