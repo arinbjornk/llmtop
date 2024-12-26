@@ -344,7 +344,7 @@ Current system data:
 Generate ONE short statement (max 15 words) about the most significant NEW insight or change."""
 
                 response = self.client.chat.completions.create(
-                    model="gpt-4-turbo-preview",
+                    model="gpt-4o-mini-2024-07-18",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
