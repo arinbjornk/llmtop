@@ -25,7 +25,7 @@ pip install llmtop
 
 llmtop supports two LLM backends for system analysis:
 
-### OpenAI (GPT-4)
+### OpenAI (GPT-4o mini)
 1. Set your OpenAI API key:
    ```bash
    export OPENAI_API_KEY='your-api-key-here'
