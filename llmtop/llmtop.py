@@ -295,10 +295,14 @@ class SystemAnalyzer:
                 'Memory Usage': f"{metrics.get('memory', {}).get('Percentage', 0):.1f}%",
                 'Active Processes': len(metrics.get('processes', [])),
                 'Network Packets': metrics.get('network', {}).get('Packets Received', 0),
-                'Disk Usage': [
-                    f"{disk.get('Mountpoint')}: {disk.get('Percentage')}%"
-                    for disk in metrics.get('disk', [])
-                    if isinstance(disk, dict)
+                # 'Disk Usage': [
+                #     f"{disk.get('Mountpoint')}: {disk.get('Percentage')}%"
+                #     for disk in metrics.get('disk', [])
+                #     if isinstance(disk, dict)
+                # ],
+                'Top Processes': [  # Add this new section
+                    f"{proc.get('Name', 'Unknown')} (CPU: {proc.get('CPU%', 0):.1f}%, Mem: {proc.get('Memory%', 0):.1f}%)"
+                    for proc in metrics.get('processes', [])[:3]  # Show top 3 processes
                 ]
             }
             
@@ -362,8 +366,11 @@ Generate ONE short statement (max 15 words) about the most significant NEW insig
 
 Current system data:
 {metrics_str}
-
-Generate ONE short statement (max 15 words) about the most significant NEW insight or change. Avoid repeating previous insights."""
+You are a system monitoring assistant. Your role is to:
+1. Analyze current system metrics and identify the most significant insight or issue
+2. Do not mention the same insights from the previous analysis
+3. Focus on trends and changes in curren stystem data rather than static states. Disk usage is not important.
+4. Provide one very short, specific statement about the most important finding"""
 
                     response = ollama.chat(
                         model="llama3.2",

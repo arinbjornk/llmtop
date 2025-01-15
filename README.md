@@ -14,57 +14,39 @@
 - Smart alerting system for resource thresholds
 - Dynamic terminal UI with auto-updating metrics
 
-## Prerequisites
+## Installation
 
-- Python 3.8+
-- pip for package installation
-- For Ollama integration: Ollama installed and running locally
-- For OpenAI integration: OpenAI API key
+Install directly from PyPI:
+```bash
+pip install llmtop
+```
 
-## Quick Start
+## LLM Backend Options
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/llmtop.git
-   cd llmtop
-   ```
+llmtop supports two LLM backends for system analysis:
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Run llmtop:
-   ```bash
-   python llmtop.py
-   ```
-
-## Configuration
-
-### Using with OpenAI
-
-1. Set your OpenAI API key as an environment variable:
+### OpenAI (GPT-4)
+1. Set your OpenAI API key:
    ```bash
    export OPENAI_API_KEY='your-api-key-here'
    ```
-
-2. Run with OpenAI integration:
+2. Run with OpenAI:
    ```bash
-   python llmtop.py --use-openai
+   llmtop --use-openai
    ```
 
-### Using with Ollama
-
-1. Ensure Ollama is installed and running locally
-2. Run llmtop:
+### Ollama (Default)
+1. Install Ollama from [ollama.ai](https://ollama.ai)
+2. Start the Ollama service
+3. Run llmtop:
    ```bash
-   python llmtop.py
+   llmtop
    ```
 
 ## Command Line Options
 
 ```bash
-python llmtop.py [OPTIONS]
+llmtop [OPTIONS]
 
 Options:
   --update-frequency INTEGER  Update frequency in seconds (default: 5)
@@ -72,6 +54,12 @@ Options:
   --history-length INTEGER   Number of historical data points to keep (default: 60)
   --help                     Show this message and exit
 ```
+
+## Usage Tips
+
+- The tool defaults to using Ollama for analysis, which is free but requires local installation
+- OpenAI mode provides more detailed analysis but requires an API key and has associated costs
+- Adjust update frequency based on your system's performance and monitoring needs
 
 ## Known Issues
 
