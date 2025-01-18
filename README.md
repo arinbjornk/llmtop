@@ -35,7 +35,7 @@ llmtop supports two LLM backends for system analysis:
    llmtop --use-openai
    ```
 
-### Ollama (Default)
+### Ollama with Llama 3.2 3B (Default)
 1. Install Ollama from [ollama.ai](https://ollama.ai)
 2. Start the Ollama service
 3. Run llmtop:
