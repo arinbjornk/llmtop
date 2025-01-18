@@ -79,7 +79,7 @@ This project is in beta, and we welcome contributions! Please feel free to:
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
+## Acknowledgements
 
 Built using:
 - Rich for terminal UI
