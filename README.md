@@ -63,7 +63,7 @@ Options:
 
 ## Known Issues
 
-- Experimental support for Windows systems
+- Experimental (untested) support for Windows systems
 - Update frequency might need adjustment on slower systems
 - Some process names may be truncated in the display
 
