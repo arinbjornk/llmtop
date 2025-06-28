@@ -372,7 +372,7 @@ You are a system monitoring assistant. Your role is to:
 4. Provide one very short, specific statement about the most important finding"""
 
                     response = ollama.chat(
-                        model="llama3.2",
+                        model="gemma3:1b-it-qat",
                         messages=[{
                             "role": "user",
                             "content": ollama_prompt
