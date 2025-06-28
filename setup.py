@@ -25,7 +25,6 @@ setup(
     install_requires=[
         "rich>=13.7.0",
         "psutil>=5.9.0",
-        "GPUtil>=1.4.0",
         "openai>=1.12.0",
         "ollama>=0.1.6",
         "python-dateutil>=2.8.2",

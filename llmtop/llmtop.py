@@ -8,7 +8,6 @@ from rich.console import Group
 from rich import box
 import psutil
 import platform
-import GPUtil
 import os
 import time
 from datetime import datetime
