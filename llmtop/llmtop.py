@@ -9,8 +9,21 @@ from typing import Dict, List, Any, Optional # Added Optional
 import logging
 import json
 import subprocess # Added for Apple Silicon
+import sys # For stdout.flush()
+import select # For non-blocking keyboard input
+import tty
+import termios
 
-# Try importing GPUtil, but don't fail if it's not there
+# Import Apple Silicon GPU utilities (optional)
+try:
+    from . import gpu_utils
+except ImportError:
+    try:
+        import gpu_utils
+    except ImportError:
+        gpu_utils = None
+
+# Try importing optional dependencies, but don't fail if not there
 try:
     import GPUtil
 except ImportError:
@@ -60,6 +73,23 @@ class SystemMetricsCollector:
             "Processor": uname.processor
         }
 
+    def _get_uptime_string(self) -> str:
+        """Get system uptime as a human-readable string."""
+        try:
+            boot_time = psutil.boot_time()
+            uptime_seconds = time.time() - boot_time
+            days, remainder = divmod(int(uptime_seconds), 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, _ = divmod(remainder, 60)
+            if days > 0:
+                return f"{days}d {hours}h {minutes}m"
+            elif hours > 0:
+                return f"{hours}h {minutes}m"
+            else:
+                return f"{minutes}m"
+        except Exception:
+            return "N/A"
+
     def _get_cpu_info(self) -> Dict:
         try:
             # Reduce interval for less CPU overhead caused by monitoring itself
@@ -87,48 +117,64 @@ class SystemMetricsCollector:
             }
 
     def _get_apple_silicon_gpu_info(self) -> List[Dict]:
-        """Attempt to get Apple Silicon GPU info without sudo."""
+        """Get Apple Silicon GPU info, using IOReport for real-time load when available."""
         gpu_info = []
+
+        # Get static info from system_profiler
+        gpu_name = "Apple Silicon GPU"
+        vram = "N/A"
         try:
-            # Use system_profiler to get basic GPU info
             result = subprocess.run(['system_profiler', 'SPDisplaysDataType'], capture_output=True, text=True, check=True)
             output = result.stdout
 
-            # Basic parsing (this might need adjustment based on exact macOS version/output)
-            gpu_name = "Apple Silicon GPU"
-            vram = "N/A"
-            in_graphics_section = False
             for line in output.splitlines():
-                line = line.strip()
-                if "Graphics/Displays:" in line:
-                    in_graphics_section = True
-                    continue
-                if in_graphics_section:
-                    if line.startswith("Chipset Model:"):
-                        gpu_name = line.split(":", 1)[1].strip()
-                    elif line.startswith("VRAM (Total):") or line.startswith("VRAM (Dynamic, Max):"):
-                         vram_str = line.split(":", 1)[1].strip()
-                         # Keep original VRAM string (e.g., "8 GB")
-                         vram = vram_str
-                    elif line == "" and gpu_name != "Apple Silicon GPU": # End of a GPU section
-                         break # Assuming one main integrated GPU for now
+                stripped = line.strip()
+                # Parse chipset model (e.g., "Chipset Model: Apple M1 Pro")
+                if stripped.startswith("Chipset Model:"):
+                    gpu_name = stripped.split(":", 1)[1].strip()
+                # Parse VRAM info (various formats across macOS versions)
+                elif "VRAM" in stripped and ":" in stripped:
+                    vram = stripped.split(":", 1)[1].strip()
+                # Also check for "Total Number of Cores" as backup GPU identifier
+                elif stripped.startswith("Total Number of Cores:") and gpu_name == "Apple Silicon GPU":
+                    # We found GPU cores but no name yet, keep looking
+                    pass
+        except Exception as e:
+            logging.debug(f"Could not get Apple Silicon GPU info via system_profiler: {e}")
 
-            # NOTE: Real-time Load, Memory Usage %, and Temperature are typically
-            # not available without elevated privileges (sudo) using tools like 'powermetrics'.
-            # We provide placeholders here.
-            gpu_info.append({
-                "ID": 0,
-                "Name": gpu_name,
-                "Load": "N/A", # Requires specific tools/privileges
-                "Memory Used": "N/A", # Requires specific tools/privileges
-                "Memory Total": vram, # Static total VRAM
-                "Memory Util": "N/A", # Requires specific tools/privileges
-                "Temperature": "N/A", # Requires specific tools/privileges
-                "UUID": "apple-silicon",
-                "Type": "Apple"
-            })
-        except (FileNotFoundError, subprocess.CalledProcessError, Exception) as e:
-            logging.warning(f"Could not get Apple Silicon GPU info via system_profiler: {e}")
+        # Try to get real-time GPU load (no sudo required)
+        gpu_load = "N/A"
+        gpu_mem_used = "N/A"
+        if gpu_utils:
+            try:
+                # Try ioreg first (more reliable on recent macOS)
+                stats = gpu_utils.get_gpu_stats_ioreg()
+                if stats:
+                    if 'usage' in stats:
+                        gpu_load = f"{stats['usage']:.0f}%"
+                    if 'memory_used' in stats:
+                        mem_mb = stats['memory_used'] / (1024 * 1024)
+                        gpu_mem_used = f"{mem_mb:.0f}MB"
+                # Fallback to IOReport if ioreg didn't work
+                elif gpu_utils.is_available():
+                    usage = gpu_utils.get_gpu_usage(sample_duration_ms=50)
+                    if usage is not None:
+                        gpu_load = f"{usage:.1f}%"
+            except Exception as e:
+                logging.debug(f"GPU usage collection failed: {e}")
+
+        gpu_info.append({
+            "ID": 0,
+            "Name": gpu_name,
+            "Load": gpu_load,
+            "Memory Used": gpu_mem_used,
+            "Memory Total": vram if vram != "N/A" else "Unified",
+            "Memory Util": "N/A",  # Not available without powermetrics
+            "Temperature": "N/A",  # Not available without powermetrics
+            "UUID": "apple-silicon",
+            "Type": "Apple"
+        })
+
         return gpu_info
 
     def _get_gpu_info(self) -> List[Dict]:
@@ -348,14 +394,17 @@ class SystemMetricsCollector:
 class AlertManager:
     def __init__(self):
         self.thresholds = {
-            'cpu_average': 85.0, # Adjusted threshold
+            'cpu_average': 85.0, # Alert if average CPU > 85%
+            'cpu_core_spike': 95.0, # Alert if any single core > 95%
+            'cpu_cores_high': 3, # Alert if this many cores are > 80%
             'memory_percent': 90.0,
-            'disk_percent': 90.0, # Adjusted threshold
-            'swap_percent': 70.0, # Adjusted threshold
+            'disk_percent': 90.0,
+            'swap_percent': 70.0,
             'gpu_memory': 85.0,
-            'gpu_temperature': 85.0 # Adjusted threshold
+            'gpu_temperature': 85.0,
+            'gpu_load': 90.0  # Alert if GPU load > 90%
         }
-        self.alerts = deque(maxlen=20) # Keep fewer, more relevant alerts
+        self.alerts = deque(maxlen=20)
 
     def check_metrics(self, metrics: Dict) -> List[Dict]:
         logging.debug(f"Checking metrics for alerts")
@@ -366,8 +415,9 @@ class AlertManager:
              return []
 
         try:
-            # CPU alerts
-            if cpu_data := metrics.get('cpu'): # Use walrus operator for cleaner check
+            # CPU alerts - check average AND per-core spikes
+            if cpu_data := metrics.get('cpu'):
+                # Average CPU check
                 if 'Average Usage' in cpu_data:
                     cpu_usage = cpu_data['Average Usage']
                     if cpu_usage > self.thresholds['cpu_average']:
@@ -376,6 +426,30 @@ class AlertManager:
                             'level': 'critical' if cpu_usage > 95 else 'warning',
                             'component': 'CPU',
                             'message': f"High CPU usage: {cpu_usage:.1f}%"
+                        })
+
+                # Per-core spike check
+                if 'Per Core Usage' in cpu_data:
+                    per_core = cpu_data['Per Core Usage']
+                    max_core = max(per_core) if per_core else 0
+                    cores_above_80 = sum(1 for c in per_core if c > 80)
+
+                    # Alert on single core spike
+                    if max_core > self.thresholds['cpu_core_spike']:
+                        core_idx = per_core.index(max_core)
+                        new_alerts.append({
+                            'timestamp': now,
+                            'level': 'warning',
+                            'component': 'CPU',
+                            'message': f"Core {core_idx} spike: {max_core:.0f}%"
+                        })
+                    # Alert on multiple high cores
+                    elif cores_above_80 >= self.thresholds['cpu_cores_high']:
+                        new_alerts.append({
+                            'timestamp': now,
+                            'level': 'warning',
+                            'component': 'CPU',
+                            'message': f"{cores_above_80} cores above 80%"
                         })
 
             # Memory alerts
@@ -447,6 +521,21 @@ class AlertManager:
                         logging.debug(f"Could not parse GPU Temperature for {gpu_name}: {gpu.get('Temperature')}")
                         pass # Ignore if not a valid number or N/A
 
+                    # Check GPU load (for Apple Silicon via ioreg)
+                    try:
+                        load_str = gpu.get('Load', 'N/A').replace('%', '')
+                        if load_str != 'N/A':
+                            load = float(load_str)
+                            if load > self.thresholds['gpu_load']:
+                                new_alerts.append({
+                                    'timestamp': now,
+                                    'level': 'critical' if load > 95 else 'warning',
+                                    'component': 'GPU',
+                                    'message': f"High GPU load: {load:.0f}%"
+                                })
+                    except (ValueError, TypeError):
+                        pass
+
             # Append new alerts only if they are different from the last one for the same component
             if new_alerts:
                  last_alerts_by_component = {a['component']: a['message'] for a in self.alerts}
@@ -468,6 +557,8 @@ class SystemAnalyzer:
         self.use_openai = use_openai
         self.client = None
         self.ollama_available = False # Track Ollama availability
+        self.current_model = "llama3:8b" # Default Ollama model
+        self.available_models = [] # Cache of available models
 
         if use_openai:
             try:
@@ -490,8 +581,9 @@ class SystemAnalyzer:
             try:
                 import ollama
                 # Check if Ollama server is running by listing models
-                ollama.list()
+                models_response = ollama.list()
                 self.ollama_available = True
+                self._update_available_models(models_response)
                 logging.info("Ollama client appears available.")
             except ImportError:
                  logging.info("Ollama package not installed (pip install ollama). Using local analysis.")
@@ -499,8 +591,43 @@ class SystemAnalyzer:
                  logging.warning(f"Ollama connection error ({e}). Is the Ollama server running? Using local analysis.")
 
 
-        self.analyses = deque(maxlen=10) # Keep fewer, more focused analyses
+        self.analyses = deque(maxlen=20) # Keep more analyses for feed
         # Removed visible_offset as we'll display based on available space
+
+    def _update_available_models(self, models_response):
+        """Update the list of available models from Ollama response."""
+        try:
+            self.available_models = [m.get("name", "") for m in models_response.get("models", [])]
+            logging.debug(f"Available Ollama models: {self.available_models}")
+            # Set current_model to first available if current one is not available
+            if self.current_model not in self.available_models and self.available_models:
+                self.current_model = self.available_models[0]
+        except Exception as e:
+            logging.error(f"Error parsing available models: {e}")
+            self.available_models = []
+
+    def refresh_available_models(self):
+        """Fetch fresh list of available models from Ollama server."""
+        if not self.ollama_available:
+            return False
+        try:
+            import ollama
+            models_response = ollama.list()
+            self._update_available_models(models_response)
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to refresh models: {e}")
+            return False
+
+    def set_model(self, model_name: str) -> bool:
+        """Set the current Ollama model. Returns True if successful."""
+        if model_name in self.available_models:
+            self.current_model = model_name
+            logging.info(f"Switched to model: {model_name}")
+            return True
+        else:
+            logging.warning(f"Model {model_name} not in available models")
+            return False
 
 
     def get_visible_analyses(self, max_lines: int) -> List[Dict]:
@@ -524,33 +651,48 @@ class SystemAnalyzer:
 
 
     def _prepare_metrics_summary(self, metrics: Dict) -> str:
-        """Create a concise summary string for the LLM."""
+        """Create a detailed summary string for the LLM to analyze."""
         try:
             summary = []
+
+            # CPU with per-core context
             if cpu := metrics.get('cpu'):
-                summary.append(f"CPU: {cpu.get('Average Usage', 0):.1f}% avg")
+                avg_usage = cpu.get('Average Usage', 0)
+                per_core = cpu.get('Per Core Usage', [])
+                max_core = max(per_core) if per_core else 0
+                cores_above_50 = sum(1 for c in per_core if c > 50)
+                summary.append(f"CPU avg={avg_usage:.0f}%, max_core={max_core:.0f}%, {cores_above_50} cores>50%")
+
+            # Memory with swap context
             if mem := metrics.get('memory'):
-                summary.append(f"Mem: {mem.get('Percentage', 0):.1f}% ({mem.get('Used', 'N/A')})")
-                if mem.get('Swap Percentage', 0) > 10: # Only mention swap if significant
-                     summary.append(f"Swap: {mem.get('Swap Percentage', 0):.1f}%")
+                usage = mem.get('Percentage', 0)
+                swap = mem.get('Swap Percentage', 0)
+                available = mem.get('Available', 'N/A')
+                summary.append(f"Memory={usage:.0f}%, swap={swap:.0f}%, available={available}")
+
+            # GPU
             if gpus := metrics.get('gpu'):
-                 gpu_summaries = []
-                 for gpu in gpus:
-                      name = gpu.get('Name', 'GPU').split(' ')[0] # Short name
-                      load = gpu.get('Load', 'N/A')
-                      mem = gpu.get('Memory Util', 'N/A')
-                      temp = gpu.get('Temperature', 'N/A')
-                      if load != 'N/A' or mem != 'N/A' or temp != 'N/A': # Only include if has data
-                          gpu_summaries.append(f"{name}[Load:{load}, Mem:{mem}, Temp:{temp}]")
-                 if gpu_summaries:
-                     summary.append("GPU: " + ", ".join(gpu_summaries))
+                for gpu in gpus:
+                    name = gpu.get('Name', 'GPU')
+                    load_str = gpu.get('Load', 'N/A')
+                    mem_used = gpu.get('Memory Used', 'N/A')
+                    summary.append(f"GPU {name}: load={load_str}, mem={mem_used}")
 
+            # Network rates
             if net := metrics.get('network'):
-                 summary.append(f"Net: In {net.get('Recv Rate', '0bps')}, Out {net.get('Sent Rate', '0bps')}")
+                recv = net.get('Recv Rate', '0 bps')
+                sent = net.get('Sent Rate', '0 bps')
+                summary.append(f"Network: in={recv}, out={sent}")
 
+            # Top processes with both CPU and Memory
             if procs := metrics.get('processes'):
-                 top_procs = [f"{p.get('Name', '?')}({p.get('CPU%', 0):.0f}%)" for p in procs[:3]]
-                 summary.append(f"TopProcs: {', '.join(top_procs)}")
+                proc_info = []
+                for p in procs[:5]:
+                    cpu_pct = p.get('CPU%', 0)
+                    mem_pct = p.get('Memory%', 0)
+                    name = p.get('Name', '?')[:12]
+                    proc_info.append(f"{name}(cpu={cpu_pct:.0f}%,mem={mem_pct:.1f}%)")
+                summary.append(f"Processes: {', '.join(proc_info)}")
 
             return " | ".join(summary)
 
@@ -562,16 +704,29 @@ class SystemAnalyzer:
         analysis = "Analysis unavailable." # Default
         try:
             metrics_summary = self._prepare_metrics_summary(metrics)
-            prev_analyses = self.get_previous_analyses(2)
-            prev_analyses_str = "\n".join([f"- {a}" for a in prev_analyses])
 
-            prompt_context = f"""Previous insights:
-{prev_analyses_str}
+            # Prompt for insightful analysis
+            prompt_context = f"""System metrics: {metrics_summary}
 
-Current state summary:
-{metrics_summary}
+You are a system analyst. Provide ONE brief insight (max 15 words) about what's happening:
+- Identify the ROOT CAUSE if resources are high (which process? why?)
+- Note interesting patterns (high single core = single-threaded task, swap active = memory pressure)
+- If system is idle, say "System idle" and nothing more
+- Be specific: name processes and explain their impact
+- Never just repeat numbers - explain what they MEAN
 
-Identify the single most important NEW change or potential issue based *only* on the current state summary. Focus on high usage (CPU > 80%, Mem > 85%, GPU Load/Mem > 80%), significant network traffic changes, or top processes consuming resources. Avoid repeating previous insights. Be very concise (max 15 words). If stable, say so."""
+Examples of GOOD insights:
+- "Safari tabs causing memory pressure, swap active"
+- "Claude doing heavy computation on 2 cores"
+- "Ollama inference saturating GPU"
+- "System idle, all resources normal"
+
+Examples of BAD insights (don't do these):
+- "CPU high at 92%" (just repeating data)
+- "Some issues detected" (vague)
+- "High utilization" (meaningless)
+
+Insight:"""
 
             if self.use_openai and self.client:
                 try:
@@ -596,17 +751,19 @@ Identify the single most important NEW change or potential issue based *only* on
                 try:
                     import ollama
                     response = ollama.chat(
-                        model="llama3:8b", # Use a reasonably sized local model
+                        model=self.current_model,
                         messages=[{
                             "role": "user",
                             "content": prompt_context
                         }],
-                        options={"temperature": 0.2, "num_predict": 30} # Limit output
+                        options={"temperature": 0.3, "num_predict": 40} # Longer, focused insights
                     )
                     analysis = response['message']['content'].strip()
-                    logging.info(f"Ollama analysis: {analysis}")
+                    # Clean up: take only first line, remove quotes
+                    analysis = analysis.split('\n')[0].strip('"').strip()
+                    logging.info(f"Ollama analysis ({self.current_model}): {analysis}")
                 except Exception as e:
-                    logging.error(f"Ollama API call failed: {e}")
+                    logging.error(f"Ollama API call failed ({self.current_model}): {e}")
                     analysis = self._generate_local_analysis(metrics) # Fallback
             else:
                 # Fallback to simple rule-based analysis
@@ -619,17 +776,11 @@ Identify the single most important NEW change or potential issue based *only* on
             if not analysis: # Handle empty LLM response
                  analysis = self._generate_local_analysis(metrics)
 
-            # Store analysis with timestamp only if it's new or different from the last
-            last_analysis = self.analyses[-1]['analysis'] if self.analyses else None
-            if analysis != last_analysis:
-                 self.analyses.append({
-                    'timestamp': datetime.now(),
-                    'analysis': analysis,
-                 })
-            # If same as last, return the last one but don't add duplicate to history
-            elif last_analysis:
-                 analysis = last_analysis
-
+            # Always append analysis to create a feed (with timestamp)
+            self.analyses.append({
+                'timestamp': datetime.now(),
+                'analysis': analysis,
+            })
 
             return analysis
 
@@ -667,7 +818,6 @@ Identify the single most important NEW change or potential issue based *only* on
                         return f"High load on {gpu_name}: {load_str}%!"
                  except (ValueError, TypeError): pass
 
-
             if cpu_usage > 85:
                 top_proc = f" by {processes[0]['Name']}" if processes else ""
                 return f"High CPU load: {cpu_usage:.1f}%{top_proc}"
@@ -679,7 +829,14 @@ Identify the single most important NEW change or potential issue based *only* on
             if processes and processes[0].get('CPU%', 0) > 50:
                  return f"{processes[0]['Name']} using {processes[0]['CPU%']:.0f}% CPU."
 
-            return "System state normal."
+            # Normal state - show current stats summary
+            top_proc_name = processes[0]['Name'] if processes else "idle"
+            gpu_info = ""
+            if gpus:
+                gpu_load = gpus[0].get('Load', 'N/A')
+                if gpu_load != 'N/A':
+                    gpu_info = f", GPU {gpu_load}"
+            return f"Stable: CPU {cpu_usage:.0f}%, Mem {memory_usage:.0f}%{gpu_info}, top: {top_proc_name}"
 
         except Exception as e:
             logging.error(f"Error in local analysis: {str(e)}")
@@ -689,7 +846,7 @@ Identify the single most important NEW change or potential issue based *only* on
 class UIComponent:
     # Create table method adjusted to handle potentially missing keys gracefully
     def _create_table_from_dict(self, data: Dict, title: str, color: str = "white") -> Table:
-        table = Table(show_header=False, box=box.ROUNDED, padding=(0, 1))
+        table = Table(show_header=False, box=box.SIMPLE, padding=(0, 0))
         table.add_column("Key", style=f"bold {color}", no_wrap=True)
         table.add_column("Value", style="white", no_wrap=True)
         for key, value in data.items():
@@ -697,7 +854,7 @@ class UIComponent:
         return table
 
     def _create_table_from_list(self, data: List[Dict], title: str, color: str = "white") -> Table:
-        table = Table(box=box.ROUNDED, padding=(0, 1), show_header=True)
+        table = Table(box=box.SIMPLE, padding=(0, 0), show_header=True)
 
         if not data:
             table.show_header = False
@@ -712,21 +869,49 @@ class UIComponent:
         col_width = {}
 
         # --- Special handling for known table types ---
+        # Color scheme: cyan (stats), yellow (warnings/storage), green (status)
         if title.lower() == "top processes":
             headers = ["PID", "Name", "CPU%", "Memory%"] # Enforce order/presence
-            col_styles.update({"PID": "cyan", "CPU%": "green", "Memory%": "magenta"})
+            col_styles.update({"PID": "dim", "CPU%": "green", "Memory%": "cyan"})
             col_justify.update({"PID": "right", "CPU%": "right", "Memory%": "right"})
             col_width = {"PID": 7, "Name": None, "CPU%": 6, "Memory%": 8} # Let Name flex
 
         elif title.lower() == "gpu":
-            headers = ["ID", "Name", "Load", "Memory Util", "Temperature"]
-            col_styles.update({"ID": "cyan", "Load": "green", "Memory Util": "magenta", "Temperature": "red"})
-            col_justify.update({"ID": "right", "Load": "right", "Memory Util": "right", "Temperature": "right"})
-            col_width = {"ID": 3, "Name": None, "Load": 8, "Memory Util": 12, "Temperature": 8} # Let Name flex
+            # Dynamically select columns based on GPU type and available data
+            gpu_type = data[0].get("Type", "Unknown") if data else "Unknown"
+            has_load = any(gpu.get("Load") != "N/A" for gpu in data)
+            has_mem_util = any(gpu.get("Memory Util") != "N/A" for gpu in data)
+            has_mem_used = any(gpu.get("Memory Used") != "N/A" for gpu in data)
+            has_temp = any(gpu.get("Temperature") != "N/A" for gpu in data)
+
+            if has_mem_util:
+                # NVIDIA with full metrics
+                headers = ["Name", "Load", "Memory Util", "Temperature"]
+                col_styles.update({"Load": "green", "Memory Util": "cyan", "Temperature": "yellow"})
+                col_justify.update({"Load": "right", "Memory Util": "right", "Temperature": "right"})
+                col_width = {"Name": None, "Load": 8, "Memory Util": 12, "Temperature": 8}
+            elif has_load and has_mem_used:
+                # Apple Silicon with ioreg (Load + Memory Used available)
+                headers = ["Name", "Load", "Memory Used"]
+                col_styles.update({"Load": "green", "Memory Used": "cyan"})
+                col_justify.update({"Load": "right", "Memory Used": "right"})
+                col_width = {"Name": None, "Load": 6, "Memory Used": 10}
+            elif has_load:
+                # Apple Silicon with Load only
+                headers = ["Name", "Load", "Memory Total"]
+                col_styles.update({"Load": "green", "Memory Total": "cyan"})
+                col_justify.update({"Load": "right", "Memory Total": "right"})
+                col_width = {"Name": None, "Load": 6, "Memory Total": 10}
+            else:
+                # No real-time data - show static info only
+                headers = ["Name", "Memory Total", "Type"]
+                col_styles.update({"Memory Total": "cyan", "Type": "dim"})
+                col_justify.update({"Memory Total": "right"})
+                col_width = {"Name": None, "Memory Total": 10, "Type": 8}
 
         elif title.lower() == "disk":
              headers = ["Mountpoint", "Used", "Total", "Percentage"]
-             col_styles.update({"Percentage": "yellow"})
+             col_styles.update({"Percentage": "yellow", "Used": "cyan", "Total": "dim"})
              col_justify.update({"Used": "right", "Total": "right", "Percentage": "right"})
              col_width = {"Mountpoint": None, "Used": 8, "Total": 8, "Percentage": 6}
 
@@ -784,37 +969,93 @@ class SystemMonitor:
         self.ui = UIComponent()
         self.current_layout: Optional[Layout] = None # Cache layout
         self._last_has_gpu: bool = False # Track GPU state for layout changes
+        self._old_terminal_settings = None  # For keyboard input
 
+    def _check_keypress(self) -> Optional[str]:
+        """Check for keypress without blocking. Returns the key or None."""
+        try:
+            # Check if input is available
+            if select.select([sys.stdin], [], [], 0)[0]:
+                return sys.stdin.read(1)
+        except Exception:
+            pass
+        return None
+
+    def _setup_keyboard(self):
+        """Set terminal to raw mode for single keypress detection."""
+        try:
+            self._old_terminal_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        except Exception:
+            self._old_terminal_settings = None
+
+    def _restore_keyboard(self):
+        """Restore terminal to normal mode."""
+        if self._old_terminal_settings:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_terminal_settings)
+            except Exception:
+                pass
+
+    def show_model_selector_menu(self):
+        """Display an interactive model selector menu and let user choose."""
+        # Refresh available models
+        self.analyzer.refresh_available_models()
+        available = self.analyzer.available_models
+
+        if not available:
+            console.print("[yellow]No Ollama models available[/yellow]")
+            return
+
+        console.print("\n[cyan bold]Select Ollama Model[/cyan bold]")
+        console.print("-" * 40)
+
+        for i, model in enumerate(available, 1):
+            is_current = " [CURRENT]" if model == self.analyzer.current_model else ""
+            console.print(f"  {i}. {model}{is_current}")
+
+        console.print("-" * 40)
+        console.print("Enter model number (1-{}) or 'q' to cancel: ".format(len(available)), end="", highlight=False)
+        sys.stdout.flush()
+
+        try:
+            user_input = input().strip().lower()
+
+            if user_input == 'q':
+                console.print("[dim]Cancelled[/dim]")
+                return
+
+            choice = int(user_input) - 1
+            if 0 <= choice < len(available):
+                selected = available[choice]
+                self.analyzer.set_model(selected)
+                console.print(f"[green]✓ Switched to {selected}[/green]")
+            else:
+                console.print("[red]Invalid selection[/red]")
+        except (ValueError, EOFError):
+            console.print("[red]Invalid input[/red]")
+
+        time.sleep(1)  # Brief pause before resuming
 
     def generate_layout(self, current_metrics: Dict, alerts: List[Dict], analysis: str) -> Layout:
-        # Check if GPU data exists and has useful information
+        # Check if GPU data exists (show panel even if only static info available)
         gpu_data = current_metrics.get('gpu', [])
-        # GPU is "present" only if it has real data (not all N/A values)
-        has_gpu = False
-        if gpu_data:
-            for gpu in gpu_data:
-                # Check if at least one metric is not "N/A"
-                if any(gpu.get(key) != "N/A" for key in ["Load", "Memory Util", "Temperature"]):
-                    has_gpu = True
-                    break
+        has_gpu = len(gpu_data) > 0  # Show GPU panel if ANY GPU detected
 
         # Create layout structure only once if it doesn't exist OR if GPU status changed
         if not self.current_layout or self._last_has_gpu != has_gpu:
             layout = Layout()
             layout.split_column(
-                # Header: System Info (Static) - Render once?
-                Layout(Panel(self.ui.create_displayable(
-                            self.metrics_collector.system_info,
-                            f"System: {self.metrics_collector.system_info.get('Node Name', '')}", "cyan"
-                        ), box=box.MINIMAL), name="header", size=5),
+                # Header: Compact system info (2 lines)
+                Layout(name="header", size=2),
                 Layout(name="body"),
                 # Footer: Status/Timestamp
                 Layout(name="footer", size=1)
             )
 
             layout["body"].split_row(
-                Layout(name="main", ratio=3),
-                Layout(name="side", ratio=1)
+                Layout(name="main", ratio=5),
+                Layout(name="side", ratio=2)
             )
 
             layout["main"].split_column(
@@ -825,22 +1066,22 @@ class SystemMonitor:
             layout["main"]["top_row"].split_row(Layout(name="cpu"), Layout(name="memory"))
             layout["main"]["middle_row"].split_row(Layout(name="network"), Layout(name="disk"))
 
-            # Bottom row: Processes (2/3) and Alerts (1/3) side by side
+            # Bottom row: Processes (3/4) and Alerts (1/4) side by side
             layout["main"]["bottom_row"].split_row(
-                Layout(name="processes", ratio=2),
+                Layout(name="processes", ratio=3),
                 Layout(name="alerts", ratio=1)
             )
 
             # Side: conditionally add GPU based on whether data exists
             if has_gpu:
                 layout["side"].split_column(
-                    Layout(name="gpu", ratio=1), # GPU Info/Status
-                    Layout(name="analysis", ratio=2) # Analysis (extends vertically)
+                    Layout(name="gpu", size=8), # GPU Info - enough for header + 1-2 rows
+                    Layout(name="analysis") # Analysis feed takes remaining space
                 )
             else:
                 # No GPU: Analysis takes full height
                 layout["side"].split_column(
-                    Layout(name="analysis", ratio=1)
+                    Layout(name="analysis")
                 )
 
             self.current_layout = layout
@@ -851,56 +1092,61 @@ class SystemMonitor:
         # --- Update Panels with current data ---
         metrics = current_metrics # Alias for brevity
 
-        # Header (already static) - maybe add uptime?
+        # Header: Compact system info
+        sys_info = self.metrics_collector.system_info
+        uptime = self.metrics_collector._get_uptime_string()
+        header_text = Text()
+        header_text.append(f" {sys_info.get('Node Name', 'unknown')}", style="bold cyan")
+        header_text.append(f"  {sys_info.get('System', '')} {sys_info.get('Release', '')}", style="dim")
+        header_text.append(f"  {sys_info.get('Machine', '')}", style="dim")
+        header_text.append(f"  up {uptime}", style="green")
+        layout["header"].update(Panel(header_text, box=box.SIMPLE, style="dim"))
 
-        # CPU
+        # CPU (cyan - system stats)
         layout["main"]["top_row"]["cpu"].update(
-            Panel(self.ui.create_displayable(metrics.get('cpu',{}), "CPU", "green"),
-                  title="CPU", box=box.ROUNDED, border_style="green")
+            Panel(self.ui.create_displayable(metrics.get('cpu',{}), "CPU", "cyan"),
+                  title="CPU", box=box.ROUNDED, border_style="cyan")
         )
-        # Memory
+        # Memory (cyan - system stats)
         layout["main"]["top_row"]["memory"].update(
-             Panel(self.ui.create_displayable(metrics.get('memory',{}), "Memory", "magenta"),
-                  title="Memory", box=box.ROUNDED, border_style="magenta")
+             Panel(self.ui.create_displayable(metrics.get('memory',{}), "Memory", "cyan"),
+                  title="Memory", box=box.ROUNDED, border_style="cyan")
         )
-        # Network
+        # Network (cyan - system stats)
         layout["main"]["middle_row"]["network"].update(
-             Panel(self.ui.create_displayable(metrics.get('network',{}), "Network", "blue"),
-                   title="Network", box=box.ROUNDED, border_style="blue")
+             Panel(self.ui.create_displayable(metrics.get('network',{}), "Network", "cyan"),
+                   title="Network", box=box.ROUNDED, border_style="cyan")
         )
-        # Disk
+        # Disk (yellow - storage/warnings)
         layout["main"]["middle_row"]["disk"].update(
              Panel(self.ui.create_displayable(metrics.get('disk',[]), "Disk", "yellow"),
                   title="Disk", box=box.ROUNDED, border_style="yellow")
         )
-        # Processes
+        # Processes (green - status)
         layout["main"]["bottom_row"]["processes"].update(
-             Panel(self.ui.create_displayable(metrics.get('processes',[]), "Top Processes", "red"),
-                   title="Processes", box=box.ROUNDED, border_style="red")
+             Panel(self.ui.create_displayable(metrics.get('processes',[]), "Top Processes", "green"),
+                   title="Processes", box=box.ROUNDED, border_style="green")
         )
-        # GPU (only if GPU data exists)
+        # GPU (green - status)
         if has_gpu:
             layout["side"]["gpu"].update(
-                Panel(self.ui.create_displayable(metrics.get('gpu',[]), "GPU", "bright_green"),
-                      title="GPU", box=box.ROUNDED, border_style="bright_green")
+                Panel(self.ui.create_displayable(metrics.get('gpu',[]), "GPU", "green"),
+                      title="GPU", box=box.ROUNDED, border_style="green")
             )
 
-        # Analysis Panel
-        # Determine available lines for analysis dynamically (estimate)
-        console_height = console.height
-        analysis_max_lines = max(5, console_height - 30) # Rough estimate of available lines
-        visible_analyses = self.analyzer.get_visible_analyses(analysis_max_lines)
-
+        # Analysis Panel - show feed of recent analyses
+        # Show up to last 10 analyses (deque size), newest at bottom
         analysis_renderables = []
-        for item in visible_analyses:
-            ts = Text(f"[{item['timestamp'].strftime('%H:%M:%S')}]", style="dim cyan")
-            msg = Text(f" {item['analysis']}", style="white")
+        for item in list(self.analyzer.analyses):
+            ts = Text(f"[{item['timestamp'].strftime('%H:%M:%S')}] ", style="dim cyan")
+            # Truncate long messages to fit panel width
+            msg_text = item['analysis'][:80] + "..." if len(item['analysis']) > 80 else item['analysis']
+            msg = Text(msg_text, style="white")
             analysis_renderables.append(Text.assemble(ts, msg))
-            analysis_renderables.append(Text("")) # Spacer
 
         layout["side"]["analysis"].update(
             Panel(Group(*analysis_renderables) if analysis_renderables else Text("Waiting for analysis...", style="dim"),
-                  title="Analysis", box=box.ROUNDED, border_style="white")
+                  title="Analysis", box=box.ROUNDED, border_style="green")
         )
 
         # Alerts Panel
@@ -914,12 +1160,14 @@ class SystemMonitor:
 
         layout["main"]["bottom_row"]["alerts"].update(
             Panel(Group(*alert_renderables) if alert_renderables else Text("No active alerts", style="dim green"),
-                  title="Alerts", box=box.ROUNDED, border_style="red")
+                  title="Alerts", box=box.ROUNDED, border_style="yellow")
         )
 
-        # Footer
+        # Footer with keyboard shortcuts hint
+        model_info = f" | Model: {self.analyzer.current_model}" if self.analyzer.ollama_available else ""
+        shortcuts = " | [M]odel [Q]uit" if self.analyzer.ollama_available else " | [Q]uit"
         layout["footer"].update(
-             Text(f"Updated: {datetime.now():%H:%M:%S} | Refresh: {self.update_frequency}s | Log: system_monitor.log",
+             Text(f"Updated: {datetime.now():%H:%M:%S} | Refresh: {self.update_frequency}s{model_info}{shortcuts}",
                    style="dim", justify="center")
         )
 
@@ -935,6 +1183,8 @@ class SystemMonitor:
         # Don't run analysis on the very first data point to avoid weird initial state
         initial_analysis = "Waiting for data..."
 
+        # Setup keyboard for hotkeys
+        self._setup_keyboard()
 
         try:
             with Live(
@@ -946,11 +1196,25 @@ class SystemMonitor:
             ) as live:
                 # Main loop state
                 last_analysis_time = time.monotonic()
-                analysis_interval = max(15, self.update_frequency * 3) # Analyze less frequently than metrics
+                analysis_interval = max(5, self.update_frequency * 2) # Analyze every ~6-10 seconds
 
                 while True:
                     try:
                         collect_start = time.monotonic()
+
+                        # Check for keyboard shortcuts
+                        key = self._check_keypress()
+                        if key:
+                            if key.lower() == 'm' and self.analyzer.ollama_available:
+                                # Exit live display, show model selector, restart
+                                live.stop()
+                                self._restore_keyboard()
+                                self.show_model_selector_menu()
+                                self._setup_keyboard()
+                                live.start()
+                            elif key.lower() == 'q':
+                                # Quit
+                                break
 
                         # Collect metrics
                         current_metrics = self.metrics_collector.collect()
@@ -973,7 +1237,6 @@ class SystemMonitor:
                              last_analysis_time = current_time
                              logging.debug("Analysis finished.")
                         # Use existing analysis_text if not time to regenerate
-
 
                         # Update the live display
                         live.update(
@@ -1006,6 +1269,9 @@ class SystemMonitor:
             logging.critical(f"Fatal error initializing or running Live display: {str(e)}", exc_info=True)
             console.print_exception(show_locals=False) # Print traceback to console
             print(f"\nFatal error: {e}. Check system_monitor.log for details.")
+        finally:
+            # Always restore terminal settings
+            self._restore_keyboard()
 
 
 def main():
@@ -1033,24 +1299,31 @@ def main():
         action="store_true",
         help="Enable debug logging (writes more to system_monitor.log)"
     )
+    parser.add_argument(
+        "-m", "--select-model",
+        action="store_true",
+        help="Show model selection menu before starting monitoring"
+    )
     args = parser.parse_args()
 
     if args.debug:
          logging.getLogger().setLevel(logging.DEBUG)
          logging.debug("Debug logging enabled.")
 
-    # Check for sudo if on macOS for potentially better GPU info (informational)
-    if platform.system() == 'Darwin' and os.geteuid() != 0:
-         console.print("[yellow]INFO:[/yellow] Running without sudo on macOS. Real-time Apple Silicon GPU load/memory/temp might be unavailable.")
 
 
-    # Initialize and run the monitor
+    # Initialize the monitor
     monitor = SystemMonitor(
         update_frequency=args.update_frequency,
         use_openai=args.use_openai,
         history_length=args.history_length # Pass history length
     )
 
+    # Show model selection menu if requested
+    if args.select_model and monitor.analyzer.ollama_available:
+        monitor.show_model_selector_menu()
+
+    # Run the monitor
     monitor.run()
 
 
